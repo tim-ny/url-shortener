@@ -21,6 +21,7 @@
     "db:migrate": "drizzle-kit migrate --config=db/drizzle.config.ts",
     "db:studio": "drizzle-kit studio --config=db/drizzle.config.ts",
     "db:reset": "tsx scripts/reset-db.ts",
+    "db:seed": "tsx scripts/seed.ts",
     "load:redirect": "autocannon -c 200 -d 30 -p 10 localhost:3000/abc1234",
     "db:reset:full": "tsx scripts/reset-db.ts --full && npm run db:migrate"
   },
