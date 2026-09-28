@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"],
+  "//": [
+    "src only. The schema is under src/ precisely because the app imports it at",
+    "runtime, so dist/ is self-contained and deployable on its own. Including",
+    "db/drizzle.config.ts here would place a file outside rootDir and fail with",
+    "TS6059; it is a build tool, not application code."
+  ],
+  "exclude": ["node_modules", "dist", "tests", "**/*.test.ts", "db/**"]
+}
