@@ -1,13 +1,3 @@
-# Local development dependencies. Used for `npm run dev` and by integration tests.
-#
-# Health checks are tuned deliberately loose: a cold Postgres container can take
-# ~10s to accept connections, and compose's default 5s timeout would mark it
-# unhealthy during a normal `docker compose up` and prevent any migration running.
-#
-#   docker compose up -d --wait
-#
-# Migrations are applied by `npm run db:migrate`, not automatically on app boot.
-
 services:
   postgres:
     image: postgres:17-alpine
@@ -18,23 +8,16 @@ services:
       POSTGRES_PASSWORD: shortener
       POSTGRES_DB: shortener
     ports:
-      # Published on 5433, not the default 5432. If a native Postgres is already
-      # listening on 127.0.0.1:5432 (common on macOS) it wins the loopback race,
-      # so the app silently connects to the developer's personal database instead
-      # of the container and fails with a confusing "role does not exist".
-      # If 5433 is taken, change it here and in DATABASE_URL together.
-      - "5433:5432"
+      - '5433:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"]
+      test: ['CMD-SHELL', 'pg_isready -U shortener -d shortener']
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 10s
-    # The redirect hot path is read-heavy; give the buffers some room to sit in
-    # shared_buffers before the OS starts evicting them.
     command:
       - postgres
       - -c
@@ -46,18 +29,22 @@ services:
     image: redis:8-alpine
     container_name: shortener-redis
     restart: unless-stopped
-    # allkeys-lru is a safety valve: the cache is reconstructible from Postgres, so
-    # evicting cold entries under memory pressure is correct, and there is no TTL
-    # to lean on for the pathological case.
-    command: ["redis-server", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    command:
+      [
+        'redis-server',
+        '--appendonly',
+        'no',
+        '--maxmemory',
+        '256mb',
+        '--maxmemory-policy',
+        'allkeys-lru',
+      ]
     ports:
-      # 6380 for the same reason as Postgres above: a native redis-server on 6379
-      # shadows the container on loopback. Must match REDIS_URL.
-      - "6380:6379"
+      - '6380:6379'
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
       timeout: 5s
       retries: 12

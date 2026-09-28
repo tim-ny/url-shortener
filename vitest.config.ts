@@ -12,8 +12,8 @@ export default defineConfig({
 
     env: {
       NODE_ENV: 'test',
-      DATABASE_URL: 'postgres://shortener:shortener@localhost:5433/shortener_test',
-      REDIS_URL: 'redis://localhost:6380',
+      DATABASE_URL: 'postgres://shortener:shortener@localhost:5432/shortener_test',
+      REDIS_URL: 'redis://localhost:6379',
       APP_SECRET: 'test-only-secret-not-used-against-real-data-32b',
       LOG_LEVEL: 'info',
     },
