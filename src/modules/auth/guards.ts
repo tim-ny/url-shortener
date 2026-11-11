@@ -1,14 +1,14 @@
-import type { FastifyReply, FastifyRequest } from 'fastify'
 import { eq } from 'drizzle-orm'
-import { links } from '../../db/schema.js'
+import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { Database } from '../../plugins/db.js'
+import { links, type Plan, type User } from '../../db/schema.js'
+import { notFound, unauthorized } from '../../lib/errors.js'
 import { hashApiKey, isWellFormedApiKey } from './key-generator.js'
 import { findUserByKeyHash, touchApiKeyUsage } from './repository.js'
-import { isPlan, type Plan } from '../../config/plans.js'
-import { notFound, unauthorized } from '../../lib/errors.js'
 
+/** The authenticated caller, attached to the request by `authenticate`. */
 export interface Principal {
   userId: string
-  email: string
   plan: Plan
 }
 
@@ -18,69 +18,60 @@ declare module 'fastify' {
   }
 }
 
-const BEARER_PREFIX = /^Bearer\s+/i
-
+/** Reads the token from `Authorization: Bearer <key>`. */
 export function extractBearerToken(request: FastifyRequest): string | null {
   const header = request.headers.authorization
   if (typeof header !== 'string') return null
 
-  const match = BEARER_PREFIX.exec(header)
-  if (!match) return null
-
-  const token = header.slice(match[0].length).trim()
-  return token.length > 0 ? token : null
+  return /^Bearer\s+(\S+)/i.exec(header)?.[1] ?? null
 }
 
-export async function resolvePrincipal(
-  request: FastifyRequest,
-  rawKey: string | null,
-): Promise<Principal | null> {
-  if (rawKey === null || !isWellFormedApiKey(rawKey)) return null
-
-  const keyHash = hashApiKey(rawKey)
-  const user = await findUserByKeyHash(request.server.db, keyHash)
-  if (!user) return null
-
-  touchApiKeyUsage(request.server.db, keyHash)
-
-  return {
-    userId: user.id,
-    email: user.email,
-    plan: isPlan(user.plan) ? user.plan : 'free',
-  }
+interface Caller {
+  user: User
+  keyHash: string
 }
 
+async function findCaller(db: Database, token: string | null): Promise<Caller | null> {
+  if (token === null || !isWellFormedApiKey(token)) return null
+
+  const keyHash = hashApiKey(token)
+  const user = await findUserByKeyHash(db, keyHash)
+
+  return user ? { user, keyHash } : null
+}
+
+/**
+ * Rejects the request unless it carries a live API key. Applied per route rather
+ * than globally, so routes that need no auth pay nothing for it.
+ */
 export async function authenticate(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-  const principal = await resolvePrincipal(request, extractBearerToken(request))
+  const caller = await findCaller(request.server.db, extractBearerToken(request))
 
-  if (!principal) {
+  if (!caller) {
     void reply.header('WWW-Authenticate', 'Bearer realm="url-shortener"')
     throw unauthorized()
   }
 
-  request.principal = principal
+  request.principal = { userId: caller.user.id, plan: caller.user.plan }
+  touchApiKeyUsage(request.server.db, caller.keyHash)
 }
 
-export async function optionalAuth(request: FastifyRequest, _reply: FastifyReply): Promise<void> {
-  const principal = await resolvePrincipal(request, extractBearerToken(request))
-  if (principal) request.principal = principal
-}
-
-export async function requireOwner(request: FastifyRequest, _reply: FastifyReply): Promise<void> {
-  if (!request.principal) {
-    throw unauthorized()
-  }
+/**
+ * 404, never 403, when the caller does not own `:code`. A 403 would confirm the
+ * code is real and turn the API into an oracle for other people's links.
+ */
+export async function requireOwner(request: FastifyRequest): Promise<void> {
+  if (!request.principal) throw unauthorized()
 
   const { code } = request.params as { code: string }
 
-  const row = await request.server.db
+  const [link] = await request.server.db
     .select({ ownerId: links.ownerId })
     .from(links)
     .where(eq(links.code, code))
     .limit(1)
-    .then((rows) => rows[0])
 
-  if (!row || row.ownerId !== request.principal.userId) {
-    throw notFound()
-  }
+  // A null owner_id is an anonymous link: owned by nobody, including whoever
+  // created it before they deleted their account.
+  if (link?.ownerId !== request.principal.userId) throw notFound()
 }

@@ -2,24 +2,22 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { sql } from 'drizzle-orm'
 import type { FastifyInstance } from 'fastify'
 import { buildApp } from '../../src/app.js'
-import { hashApiKey, KEY_PREFIX_TEST } from '../../src/modules/auth/key-generator.js'
-import { isWellFormedApiKey } from '../../src/modules/auth/key-generator.js'
+import { captureLogs, NO_RATE_LIMITS, truncateAll } from '../helpers.js'
+import {
+  hashApiKey,
+  isWellFormedApiKey,
+  KEY_PREFIX_TEST,
+} from '../../src/modules/auth/key-generator.js'
 import { verifyPassword } from '../../src/modules/auth/password.js'
 import { apiKeys, users } from '../../src/db/schema.js'
-import { badRequest } from '../../src/lib/errors.js'
+import { AppError } from '../../src/lib/errors.js'
 
 let app: FastifyInstance
 
 const PASSWORD = 'a-sufficiently-long-password'
 
-async function appWithAuthLimits(): Promise<FastifyInstance> {
-  return buildApp({
-    rateLimitOverrides: { register: 10_000, auth: 10_000 },
-  })
-}
-
 beforeAll(async () => {
-  app = await appWithAuthLimits()
+  app = await buildApp({ rateLimits: NO_RATE_LIMITS })
 })
 
 afterAll(async () => {
@@ -27,47 +25,72 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await app.db.execute(sql`TRUNCATE TABLE users, api_keys, links, clicks RESTART IDENTITY CASCADE`)
+  await truncateAll(app)
 })
 
-interface RegisterResponse {
-  user: { id: string; email: string; plan: string; createdAt: string }
-  apiKey: { key: string; prefix: string; id: string; createdAt: string }
+interface UserBody {
+  id: string
+  email: string
+  plan: string
+  createdAt: string
 }
 
-interface ErrorResponse {
+interface IssuedKeyBody {
+  id: string
+  key: string
+  prefix: string
+  createdAt: string
+}
+
+interface ErrorBody {
   error: { code: string; message: string }
 }
 
-async function register(
-  email = 'user@example.com',
-  password = PASSWORD,
-  keyName?: string,
-): Promise<{ status: number; body: RegisterResponse | ErrorResponse; key: string }> {
-  const response = await app.inject({
-    method: 'POST',
-    url: '/v1/auth/register',
-    payload: { email, password, ...(keyName ? { keyName } : {}) },
-  })
-
-  const body: RegisterResponse | ErrorResponse = response.json()
-  const key = 'apiKey' in body ? body.apiKey.key : ''
-
-  return { status: response.statusCode, body, key }
-}
-
-function asError(body: RegisterResponse | ErrorResponse): ErrorResponse {
-  if (!('error' in body)) throw new Error('expected an error response, got a success body')
-  return body
-}
-
-function asUser(body: RegisterResponse | ErrorResponse): RegisterResponse {
-  if ('error' in body) throw new Error(`expected a success body, got ${body.error.code}`)
-  return body
-}
+type CredentialsResponse = { user: UserBody; apiKey: IssuedKeyBody }
 
 function auth(key: string) {
   return { authorization: `Bearer ${key}` }
+}
+
+function asError(body: unknown): ErrorBody {
+  const parsed = body as CredentialsResponse | ErrorBody
+  if (!('error' in parsed)) throw new Error('expected an error response, got a success body')
+  return parsed
+}
+
+function asCredentials(body: unknown): CredentialsResponse {
+  const parsed = body as CredentialsResponse | ErrorBody
+  if ('error' in parsed) throw new Error(`expected a success body, got ${parsed.error.code}`)
+  return parsed
+}
+
+async function register(email = 'user@example.com', keyName?: string) {
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/auth/register',
+    payload: { email, password: PASSWORD, ...(keyName ? { keyName } : {}) },
+  })
+
+  const body = response.json<CredentialsResponse | ErrorBody>()
+
+  return {
+    status: response.statusCode,
+    body,
+    key: 'apiKey' in body ? body.apiKey.key : '',
+  }
+}
+
+async function login(email: string, password = PASSWORD) {
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/auth/login',
+    payload: { email, password },
+  })
+
+  return {
+    status: response.statusCode,
+    body: response.json<CredentialsResponse | ErrorBody>(),
+  }
 }
 
 async function userRowByEmail(email: string) {
@@ -84,13 +107,12 @@ describe('POST /v1/auth/register', () => {
     const { status, body, key } = await register()
 
     expect(status).toBe(201)
-    expect(asUser(body).user.email).toBe('user@example.com')
-    expect(asUser(body).user.plan).toBe('free')
+    expect(asCredentials(body).user.email).toBe('user@example.com')
+    expect(asCredentials(body).user.plan).toBe('free')
     expect(isWellFormedApiKey(key)).toBe(true)
 
     const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(key) })
     expect(me.statusCode).toBe(200)
-    expect(me.json().user.email).toBe('user@example.com')
   })
 
   it('stores the password as an argon2id hash, never plaintext', async () => {
@@ -109,9 +131,7 @@ describe('POST /v1/auth/register', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]!.keyHash).toBe(hashApiKey(key))
     expect(rows[0]!.keyHash).toMatch(/^[0-9a-f]{64}$/)
-
-    const dumped = JSON.stringify(rows[0])
-    expect(dumped).not.toContain(key)
+    expect(JSON.stringify(rows[0])).not.toContain(key)
   })
 
   it('stores a display prefix but not the full key', async () => {
@@ -126,6 +146,7 @@ describe('POST /v1/auth/register', () => {
   it('issues a different key on each registration', async () => {
     const first = await register('a@example.com')
     const second = await register('b@example.com')
+
     expect(first.key).not.toBe(second.key)
   })
 
@@ -154,6 +175,7 @@ describe('POST /v1/auth/register', () => {
       url: '/v1/auth/register',
       payload: { email: 'not-an-email', password: PASSWORD },
     })
+
     expect(response.statusCode).toBe(400)
   })
 
@@ -163,13 +185,16 @@ describe('POST /v1/auth/register', () => {
       url: '/v1/auth/register',
       payload: { email: 'a@example.com', password: PASSWORD, isAdmin: true },
     })
+
     expect(response.statusCode).toBe(400)
   })
 
   it('never returns the stored hashes', async () => {
     const { body } = await register()
-    expect(asUser(body).user).not.toHaveProperty('passwordHash')
-    expect(asUser(body).apiKey).not.toHaveProperty('keyHash')
+    const credentials = asCredentials(body)
+
+    expect(credentials.user).not.toHaveProperty('passwordHash')
+    expect(credentials.apiKey).not.toHaveProperty('keyHash')
   })
 })
 
@@ -177,34 +202,20 @@ describe('POST /v1/auth/login', () => {
   it('exchanges credentials for a fresh key', async () => {
     await register()
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/auth/login',
-      payload: { email: 'user@example.com', password: PASSWORD },
-    })
+    const { status, body } = await login('user@example.com')
 
-    expect(response.statusCode).toBe(200)
-    const key = response.json().apiKey.key
-    expect(isWellFormedApiKey(key)).toBe(true)
-
-    const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(key) })
-    expect(me.statusCode).toBe(200)
+    expect(status).toBe(200)
+    expect(isWellFormedApiKey(asCredentials(body).apiKey.key)).toBe(true)
   })
 
   it('issues a new key each time without invalidating the old one', async () => {
-    const { key: first } = await register()
+    const first = await register()
 
-    const second = (
-      await app.inject({
-        method: 'POST',
-        url: '/v1/auth/login',
-        payload: { email: 'user@example.com', password: PASSWORD },
-      })
-    ).json().apiKey.key
+    const second = (await login('user@example.com')).body as CredentialsResponse
 
-    expect(second).not.toBe(first)
+    expect(second.apiKey.key).not.toBe(first.key)
 
-    for (const key of [first, second]) {
+    for (const key of [first.key, second.apiKey.key]) {
       const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(key) })
       expect(me.statusCode).toBe(200)
     }
@@ -212,51 +223,32 @@ describe('POST /v1/auth/login', () => {
 
   it('is case-insensitive on the email, because the column is citext', async () => {
     await register('mixed@example.com')
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/auth/login',
-      payload: { email: 'MiXeD@Example.com', password: PASSWORD },
-    })
-    expect(response.statusCode).toBe(200)
+
+    expect((await login('MiXeD@Example.com')).status).toBe(200)
   })
 
   it('rejects a wrong password with 401', async () => {
     await register()
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/auth/login',
-      payload: { email: 'user@example.com', password: 'the-wrong-password' },
-    })
 
-    expect(response.statusCode).toBe(401)
-    expect(response.json().error.code).toBe('invalid_credentials')
+    const { status, body } = await login('user@example.com', 'the-wrong-password')
+
+    expect(status).toBe(401)
+    expect(asError(body).error.code).toBe('invalid_credentials')
   })
 
   it('gives an unknown email the same response as a wrong password', async () => {
     await register('real@example.com')
 
-    const wrongPassword = await app.inject({
-      method: 'POST',
-      url: '/v1/auth/login',
-      payload: { email: 'real@example.com', password: 'not-the-password' },
-    })
+    const wrongPassword = await login('real@example.com', 'not-the-password')
+    const unknownEmail = await login('nobody@example.com', 'not-the-password')
 
-    const unknownEmail = await app.inject({
-      method: 'POST',
-      url: '/v1/auth/login',
-      payload: { email: 'nobody@example.com', password: 'not-the-password' },
-    })
-
-    expect(unknownEmail.statusCode).toBe(wrongPassword.statusCode)
-    expect(unknownEmail.json()).toEqual(wrongPassword.json())
+    expect(unknownEmail.status).toBe(wrongPassword.status)
+    expect(unknownEmail.body).toEqual(wrongPassword.body)
   })
 
   it('creates no account as a side effect of a failed login', async () => {
-    await app.inject({
-      method: 'POST',
-      url: '/v1/auth/login',
-      payload: { email: 'ghost@example.com', password: PASSWORD },
-    })
+    await login('ghost@example.com')
+
     expect(await userRowByEmail('ghost@example.com')).toBeUndefined()
   })
 })
@@ -264,16 +256,17 @@ describe('POST /v1/auth/login', () => {
 describe('GET /v1/auth/me', () => {
   it('returns the caller and their plan', async () => {
     const { key } = await register()
+
     const response = await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(key) })
 
     expect(response.statusCode).toBe(200)
-    const body = response.json()
-    expect(body.user.email).toBe('user@example.com')
-    expect(body.user.plan).toBe('free')
+    expect(response.json().user.email).toBe('user@example.com')
+    expect(response.json().user.plan).toBe('free')
   })
 
   it('rejects a request with no Authorization header', async () => {
     const response = await app.inject({ method: 'GET', url: '/v1/auth/me' })
+
     expect(response.statusCode).toBe(401)
   })
 
@@ -283,6 +276,7 @@ describe('GET /v1/auth/me', () => {
       url: '/v1/auth/me',
       headers: auth(`usk_test_${'a'.repeat(43)}`),
     })
+
     expect(response.statusCode).toBe(401)
   })
 
@@ -292,11 +286,13 @@ describe('GET /v1/auth/me', () => {
       url: '/v1/auth/me',
       headers: auth('garbage'),
     })
+
     expect(response.statusCode).toBe(401)
   })
 
   it('sets WWW-Authenticate on 401', async () => {
     const response = await app.inject({ method: 'GET', url: '/v1/auth/me' })
+
     expect(response.headers['www-authenticate']).toContain('Bearer')
   })
 
@@ -305,6 +301,7 @@ describe('GET /v1/auth/me', () => {
     await app.db.execute(sql`DELETE FROM users`)
 
     const response = await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(key) })
+
     expect(response.statusCode).toBe(401)
   })
 
@@ -312,8 +309,8 @@ describe('GET /v1/auth/me', () => {
     const { key } = await register()
 
     await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(key) })
-
     await new Promise((resolve) => setTimeout(resolve, 150))
+
     const [row] = await app.db.select().from(apiKeys)
     expect(row!.lastUsedAt).not.toBeNull()
   })
@@ -321,16 +318,15 @@ describe('GET /v1/auth/me', () => {
 
 describe('GET /v1/auth/keys', () => {
   it('lists the caller’s keys, newest first, without the secrets', async () => {
-    const { key: first } = await register('user@example.com', PASSWORD, 'laptop')
-    const second = (
-      await app.inject({
-        method: 'POST',
-        url: '/v1/auth/login',
-        payload: { email: 'user@example.com', password: PASSWORD, keyName: 'ci' },
-      })
-    ).json().apiKey.key
+    const first = await register('user@example.com', 'laptop')
+    const second = (await app.inject({
+      method: 'POST',
+      url: '/v1/auth/login',
+      payload: { email: 'user@example.com', password: PASSWORD, keyName: 'ci' },
+    })).json().apiKey.key
 
-    const response = await app.inject({ method: 'GET', url: '/v1/auth/keys', headers: auth(first) })
+    const response = await app.inject({ method: 'GET', url: '/v1/auth/keys', headers: auth(first.key) })
+
     expect(response.statusCode).toBe(200)
 
     const keys = response.json().keys
@@ -338,39 +334,32 @@ describe('GET /v1/auth/keys', () => {
     expect(keys[0].name).toBe('ci')
 
     const serialised = JSON.stringify(response.json())
-    expect(serialised).not.toContain(first)
+    expect(serialised).not.toContain(first.key)
     expect(serialised).not.toContain(second)
   })
 
   it('does not list another user’s keys', async () => {
-    const { key: mine } = await register('mine@example.com')
+    const { key } = await register('mine@example.com')
     await register('theirs@example.com')
 
-    const response = await app.inject({ method: 'GET', url: '/v1/auth/keys', headers: auth(mine) })
+    const response = await app.inject({ method: 'GET', url: '/v1/auth/keys', headers: auth(key) })
+
     expect(response.json().keys).toHaveLength(1)
   })
 
   it('requires authentication', async () => {
     const response = await app.inject({ method: 'GET', url: '/v1/auth/keys' })
+
     expect(response.statusCode).toBe(401)
   })
 })
 
 describe('DELETE /v1/auth/keys/:id', () => {
   it('revokes a key and stops it working immediately', async () => {
-    const { key: first } = await register()
-    const second = (
-      await app.inject({
-        method: 'POST',
-        url: '/v1/auth/login',
-        payload: { email: 'user@example.com', password: PASSWORD },
-      })
-    ).json().apiKey.key
+    const first = await register()
+    const second = asCredentials((await login('user@example.com')).body).apiKey.key
 
-    const [row] = await app.db
-      .select()
-      .from(apiKeys)
-      .where(sql`${apiKeys.name} = 'default'`)
+    const [row] = await app.db.select().from(apiKeys)
     const revoked = await app.inject({
       method: 'DELETE',
       url: `/v1/auth/keys/${row!.id}`,
@@ -379,7 +368,8 @@ describe('DELETE /v1/auth/keys/:id', () => {
     expect(revoked.statusCode).toBe(204)
 
     expect(
-      (await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(first) })).statusCode,
+      (await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(first.key) }))
+        .statusCode,
     ).toBe(401)
     expect(
       (await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(second) })).statusCode,
@@ -398,25 +388,22 @@ describe('DELETE /v1/auth/keys/:id', () => {
   })
 
   it('returns 404, not 403, for another user’s key', async () => {
-    const { key: mine } = await register('mine@example.com')
+    const { key } = await register('mine@example.com')
     await register('theirs@example.com')
 
-    const [theirKey] = await app.db
-      .select()
-      .from(apiKeys)
-      .where(
-        sql`${apiKeys.name} = 'default' AND ${apiKeys.userId} != (SELECT id FROM users WHERE email = 'mine@example.com')`,
-      )
+    const [theirKey] = await app.db.select().from(apiKeys).where(
+      sql`${apiKeys.name} = 'default' AND ${apiKeys.userId} != (SELECT id FROM users WHERE email = 'mine@example.com')`,
+    )
 
     const theirs = await app.inject({
       method: 'DELETE',
       url: `/v1/auth/keys/${theirKey!.id}`,
-      headers: auth(mine),
+      headers: auth(key),
     })
     const nonexistent = await app.inject({
       method: 'DELETE',
       url: `/v1/auth/keys/${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}`,
-      headers: auth(mine),
+      headers: auth(key),
     })
 
     expect(theirs.statusCode).toBe(404)
@@ -425,8 +412,8 @@ describe('DELETE /v1/auth/keys/:id', () => {
   })
 
   it('leaves the other user’s key working', async () => {
-    const { key: mine } = await register('mine@example.com')
-    const { key: theirs } = await register('theirs@example.com')
+    const { key } = await register('mine@example.com')
+    const theirs = await register('theirs@example.com')
 
     const [theirKey] = await app.db
       .select()
@@ -436,15 +423,16 @@ describe('DELETE /v1/auth/keys/:id', () => {
     await app.inject({
       method: 'DELETE',
       url: `/v1/auth/keys/${theirKey!.id}`,
-      headers: auth(mine),
+      headers: auth(key),
     })
 
     expect(
-      (await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(theirs) })).statusCode,
+      (await app.inject({ method: 'GET', url: '/v1/auth/me', headers: auth(theirs.key) }))
+        .statusCode,
     ).toBe(200)
   })
 
-  it('requires authentication', async () => {
+  it('requires authentication, and revokes nothing without it', async () => {
     await register()
     const [row] = await app.db.select().from(apiKeys)
 
@@ -457,71 +445,50 @@ describe('DELETE /v1/auth/keys/:id', () => {
 
   it('rejects a non-uuid id', async () => {
     const { key } = await register()
+
     const response = await app.inject({
       method: 'DELETE',
       url: '/v1/auth/keys/not-a-uuid',
       headers: auth(key),
     })
+
     expect(response.statusCode).toBe(400)
   })
 })
 
-describe('credentials never reach the log', () => {
+describe('logging', () => {
   it('keeps the key and password out of the log output', async () => {
-    const { Writable } = await import('node:stream')
-    const chunks: string[] = []
-    const sink = new Writable({
-      write(chunk, _enc, cb) {
-        chunks.push(String(chunk))
-        cb()
-      },
-    })
+    const logs = captureLogs()
+    const logged = await buildApp({ logSink: logs.sink, rateLimits: NO_RATE_LIMITS })
 
-    const logged = await buildApp({
-      logDestination: sink,
-      rateLimitOverrides: { register: 10_000, auth: 10_000 },
-    })
     try {
-      const response = await logged.inject({
+      const registered = await logged.inject({
         method: 'POST',
         url: '/v1/auth/register',
         payload: { email: 'logged@example.com', password: PASSWORD },
       })
-      const { apiKey } = JSON.parse(response.body) as RegisterResponse
-      const key = apiKey.key
+      const apiKey = asCredentials(registered.json()).apiKey.key
 
       const me = await logged.inject({
         method: 'GET',
         url: '/v1/auth/me',
-        headers: { authorization: `Bearer ${key}` },
+        headers: auth(apiKey),
       })
       expect(me.statusCode).toBe(200)
 
-      const output = chunks.join('')
-      expect(output).not.toContain(key)
+      const output = await logs.read()
+      expect(output).not.toContain(apiKey)
       expect(output).not.toContain(PASSWORD)
-      expect(output).not.toContain(key.slice(KEY_PREFIX_TEST.length, KEY_PREFIX_TEST.length + 8))
+      expect(output).not.toContain(apiKey.slice(KEY_PREFIX_TEST.length, KEY_PREFIX_TEST.length + 8))
     } finally {
       await logged.close()
     }
   })
-})
 
-describe('an internal error does not leak details', () => {
   it('returns a generic 500 and keeps the detail in the log', async () => {
-    const { Writable } = await import('node:stream')
-    const chunks: string[] = []
-    const sink = new Writable({
-      write(chunk, _enc, cb) {
-        chunks.push(String(chunk))
-        cb()
-      },
-    })
+    const logs = captureLogs()
+    const broken = await buildApp({ logSink: logs.sink, rateLimits: NO_RATE_LIMITS })
 
-    const broken = await buildApp({
-      logDestination: sink,
-      rateLimitOverrides: { register: 10_000, auth: 10_000 },
-    })
     try {
       broken.get('/boom', () => {
         throw new Error('select * from users where password_hash = $1 -- hunter2')
@@ -533,9 +500,7 @@ describe('an internal error does not leak details', () => {
       expect(response.json()).toEqual({
         error: { code: 'internal_error', message: 'Internal server error.' },
       })
-
-      const output = chunks.join('')
-      expect(output).toContain('hunter2')
+      expect(await logs.read()).toContain('hunter2')
       expect(response.body).not.toContain('hunter2')
     } finally {
       await broken.close()
@@ -543,20 +508,11 @@ describe('an internal error does not leak details', () => {
   })
 
   it('renders a thrown AppError as its own status and code', async () => {
-    const { Writable } = await import('node:stream')
-    const sink = new Writable({
-      write(_c, _e, cb) {
-        cb()
-      },
-    })
+    const broken = await buildApp({ logSink: captureLogs().sink, rateLimits: NO_RATE_LIMITS })
 
-    const broken = await buildApp({
-      logDestination: sink,
-      rateLimitOverrides: { register: 10_000, auth: 10_000 },
-    })
     try {
       broken.get('/app-error', () => {
-        throw badRequest('destination url is not allowed')
+        throw new AppError('bad_request', 400, 'destination url is not allowed')
       })
 
       const response = await broken.inject({ method: 'GET', url: '/app-error' })

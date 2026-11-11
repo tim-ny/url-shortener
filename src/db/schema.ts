@@ -120,12 +120,9 @@ export const clicks = pgTable(
 )
 
 export type User = typeof users.$inferSelect
-export type NewUser = typeof users.$inferInsert
 export type ApiKey = typeof apiKeys.$inferSelect
-export type NewApiKey = typeof apiKeys.$inferInsert
 export type Link = typeof links.$inferSelect
-export type NewLink = typeof links.$inferInsert
 export type Click = typeof clicks.$inferSelect
-export type NewClick = typeof clicks.$inferInsert
 
-export const clicksOnConflictTarget = [clicks.code, clicks.bucket]
+/** The plan column is the single source of truth for plan names. */
+export type Plan = (typeof userPlan.enumValues)[number]

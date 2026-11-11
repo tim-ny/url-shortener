@@ -1,52 +1,42 @@
-import type { FastifyInstance } from 'fastify'
-import { AppError } from '../lib/errors.js'
+import type { FastifyError, FastifyInstance, FastifyReply } from 'fastify'
+import { AppError, type ErrorCode } from '../lib/errors.js'
 
-const PASS_THROUGH_MIN = 400
-const PASS_THROUGH_MAX = 499
-
-function statusOf(error: unknown): number | undefined {
-  if (typeof error !== 'object' || error === null) return undefined
-  const { statusCode } = error as { statusCode?: unknown }
-  return typeof statusCode === 'number' ? statusCode : undefined
+function sendError(reply: FastifyReply, statusCode: number, code: ErrorCode, message: string) {
+  return reply.code(statusCode).send({ error: { code, message } })
 }
 
-function messageOf(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback
+/** Picks the stable code for a 4xx that did not come from an AppError. */
+function codeFor(error: FastifyError, statusCode: number): ErrorCode {
+  if (error.validation) return 'validation_failed'
+  if (statusCode === 429) return 'rate_limited'
+  return 'bad_request'
 }
 
+/**
+ * One response shape for everything thrown: `{ error: { code, message } }`.
+ *
+ * - An AppError uses its own status and code.
+ * - A 4xx from Fastify or a plugin is relayed, not swallowed. Its message is
+ *   deliberately client-facing, and turning a rate-limited request into a 500
+ *   tells a legitimate client to retry immediately.
+ * - Anything else is a bare 500. The default handler would serialise the error's
+ *   own message, and for a database driver that is the failing SQL with bound
+ *   values inline. The detail goes to the log and nowhere else.
+ */
 export function registerErrors(app: FastifyInstance): void {
-  app.setErrorHandler((error: unknown, request, reply) => {
+  app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error instanceof AppError) {
-      return reply.code(error.statusCode).send(error.toBody())
+      return sendError(reply, error.statusCode, error.code, error.message)
     }
 
-    const isValidationError =
-      typeof error === 'object' &&
-      error !== null &&
-      'validation' in error &&
-      Boolean((error as { validation?: unknown }).validation)
+    const statusCode = error.statusCode ?? 500
 
-    if (isValidationError) {
-      return reply.code(400).send({
-        error: {
-          code: 'validation_failed',
-          message: messageOf(error, 'Request validation failed.'),
-        },
-      })
-    }
-
-    const status = statusOf(error)
-    if (status !== undefined && status >= PASS_THROUGH_MIN && status <= PASS_THROUGH_MAX) {
-      const code = status === 429 ? 'rate_limited' : 'bad_request'
-      return reply.code(status).send({
-        error: { code, message: messageOf(error, `Request failed with status ${status}.`) },
-      })
+    if (statusCode >= 400 && statusCode < 500) {
+      return sendError(reply, statusCode, codeFor(error, statusCode), error.message)
     }
 
     request.log.error({ err: error }, 'unhandled error')
 
-    return reply.code(500).send({
-      error: { code: 'internal_error', message: 'Internal server error.' },
-    })
+    return sendError(reply, 500, 'internal_error', 'Internal server error.')
   })
 }

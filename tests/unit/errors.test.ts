@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
   AppError,
-  badRequest,
   emailTaken,
   invalidCredentials,
   isUniqueViolation,
@@ -12,18 +11,15 @@ import {
 describe('AppError', () => {
   it('carries a machine code and an HTTP status separately', () => {
     const err = new AppError('bad_request', 422, 'nope')
+
     expect(err.code).toBe('bad_request')
     expect(err.statusCode).toBe(422)
-  })
-
-  it('serialises to the single documented body shape', () => {
-    expect(unauthorized().toBody()).toEqual({
-      error: { code: 'unauthorized', message: 'A valid API key is required.' },
-    })
+    expect(err.message).toBe('nope')
   })
 
   it('is a real Error, so stacks and instanceof work', () => {
     const err = emailTaken()
+
     expect(err).toBeInstanceOf(Error)
     expect(err).toBeInstanceOf(AppError)
     expect(err.stack).toBeTruthy()
@@ -31,12 +27,14 @@ describe('AppError', () => {
 })
 
 describe('the not-found helper', () => {
-  it('gives one message for both causes', () => {
-    const nonexistent = notFound()
-    const unowned = notFound()
+  it('is the only source of a 404, with one fixed code and message', () => {
+    // The rule: a 403 would confirm the resource is real, so "not yours" and
+    // "does not exist" must be indistinguishable in the response.
+    const error = notFound()
 
-    expect(unowned.statusCode).toBe(nonexistent.statusCode)
-    expect(unowned.toBody()).toEqual(nonexistent.toBody())
+    expect(error.statusCode).toBe(404)
+    expect(error.code).toBe('not_found')
+    expect(error.message).toBe('Link not found.')
   })
 })
 
@@ -46,8 +44,12 @@ describe('credential errors', () => {
   })
 
   it('does not echo the submitted email', () => {
-    const email = 'victim@example.com'
-    expect(invalidCredentials().message).not.toContain(email)
+    expect(invalidCredentials().message).not.toContain('victim@example.com')
+  })
+
+  it('defaults the 401 message', () => {
+    expect(unauthorized().message).toBe('A valid API key is required.')
+    expect(unauthorized('custom').message).toBe('custom')
   })
 })
 
@@ -55,14 +57,13 @@ describe('isUniqueViolation', () => {
   const pgError = (code: string, constraint?: string) =>
     Object.assign(new Error('duplicate key'), { code, constraint })
 
-  it('detects a 23505 at the top level', () => {
+  it('detects a 23505', () => {
     expect(isUniqueViolation(pgError('23505', 'users_email_idx'))).toBe(true)
   })
 
-  it('walks the cause chain', () => {
-    const wrapped = Object.assign(new Error('Failed query'), {
-      cause: Object.assign(new Error('inner'), { cause: pgError('23505', 'users_email_idx') }),
-    })
+  it('looks through the wrapper Drizzle puts around driver errors', () => {
+    const wrapped = new Error('Failed query', { cause: pgError('23505', 'users_email_idx') })
+
     expect(isUniqueViolation(wrapped, 'users_email_idx')).toBe(true)
   })
 
@@ -70,7 +71,6 @@ describe('isUniqueViolation', () => {
     const loop: { code?: string; cause?: unknown } = { code: '99999' }
     loop.cause = loop
 
-    expect(() => isUniqueViolation(loop)).not.toThrow()
     expect(isUniqueViolation(loop)).toBe(false)
   })
 
@@ -89,11 +89,5 @@ describe('isUniqueViolation', () => {
     expect(isUniqueViolation(pgError('23503'))).toBe(false)
     expect(isUniqueViolation(undefined)).toBe(false)
     expect(isUniqueViolation('a string')).toBe(false)
-  })
-})
-
-describe('badRequest', () => {
-  it('keeps the caller’s message', () => {
-    expect(badRequest('url is not allowed').message).toBe('url is not allowed')
   })
 })

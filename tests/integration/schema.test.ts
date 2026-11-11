@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { sql } from 'drizzle-orm'
-import { Pool } from 'pg'
 import * as schema from '../../src/db/schema.js'
 import { buildApp } from '../../src/app.js'
+import { truncateAll } from '../helpers.js'
 import type { FastifyInstance } from 'fastify'
 
 let app: FastifyInstance
@@ -16,9 +16,7 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await app.db.execute(sql`
-    TRUNCATE TABLE users, api_keys, links, clicks RESTART IDENTITY CASCADE
-  `)
+  await truncateAll(app)
 })
 
 async function makeUser(email = 'a@example.com') {
@@ -234,15 +232,11 @@ describe('clicks', () => {
 })
 
 describe('migration state', () => {
-  it('has no pending migrations', async () => {
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL })
-    try {
-      const { rows } = await pool.query<{ count: string }>(
-        'SELECT count(*)::text AS count FROM drizzle.__drizzle_migrations',
-      )
-      expect(Number(rows[0]!.count)).toBeGreaterThanOrEqual(2)
-    } finally {
-      await pool.end()
-    }
+  it('has both migrations applied', async () => {
+    const { rows } = await app.db.execute<{ count: string }>(
+      sql`SELECT count(*)::text AS count FROM drizzle.__drizzle_migrations`,
+    )
+
+    expect(Number(rows[0]!.count)).toBeGreaterThanOrEqual(2)
   })
 })

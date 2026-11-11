@@ -8,9 +8,8 @@ export type Database = NodePgDatabase<typeof schema>
 
 declare module 'fastify' {
   interface FastifyInstance {
+    /** Every route reaches Postgres through this, as `request.server.db`. */
     db: Database
-    pool: Pool
-    pingDatabase: () => Promise<void>
   }
 }
 
@@ -26,14 +25,10 @@ export function registerDb(app: FastifyInstance): void {
     app.log.error({ err }, 'postgres pool client error')
   })
 
-  const db = drizzle(pool, { schema })
+  app.decorate('db', drizzle(pool, { schema }))
 
-  app.decorate('db', db)
-  app.decorate('pool', pool)
-  app.decorate('pingDatabase', async () => {
-    await pool.query('SELECT 1')
-  })
-
+  // Graceful shutdown: closing the pool lets in-flight requests finish instead
+  // of cutting them off mid-query.
   app.addHook('onClose', async () => {
     await pool.end()
   })

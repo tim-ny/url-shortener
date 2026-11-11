@@ -1,6 +1,8 @@
 import { hash, verify } from '@node-rs/argon2'
 import { env } from '../../config/env.js'
 
+// argon2id 2 is the OWASP baseline (m=19456 KiB, t=2, p=1). Production refuses
+// to boot below it; see src/config/env.ts.
 const ARGON2ID = 2
 
 const OPTIONS = {
@@ -14,19 +16,7 @@ export function hashPassword(password: string): Promise<string> {
   return hash(password, OPTIONS)
 }
 
+/** Never throws: a corrupt stored hash is a failed login, not a 500. */
 export function verifyPassword(encodedHash: string, password: string): Promise<boolean> {
   return verify(encodedHash, password, OPTIONS).catch(() => false)
-}
-
-const DUMMY_HASH = await hashPassword('timing-equalisation-not-a-real-password')
-
-export async function verifyPasswordOrDummy(
-  encoded: string | null,
-  password: string,
-): Promise<boolean> {
-  if (encoded === null) {
-    await verifyPassword(DUMMY_HASH, password)
-    return false
-  }
-  return verifyPassword(encoded, password)
 }

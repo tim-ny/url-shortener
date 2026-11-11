@@ -1,9 +1,7 @@
-import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance } from 'fastify'
-import pino from 'pino'
+import Fastify, { type FastifyInstance, type FastifyLoggerOptions } from 'fastify'
+import type { LoggerOptions } from 'pino'
 import helmet from '@fastify/helmet'
-import sensible from '@fastify/sensible'
 import rateLimit from '@fastify/rate-limit'
-import { randomUUID } from 'node:crypto'
 import { env } from './config/env.js'
 import { registerDb } from './plugins/db.js'
 import { registerCache } from './plugins/cache.js'
@@ -11,22 +9,22 @@ import { registerErrors } from './plugins/errors.js'
 import { registerHealth } from './modules/health/routes.js'
 import { registerAuthRoutes } from './modules/auth/routes.js'
 
-const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/
-
-const SYSTEM_PATHS = new Set(['livez', 'readyz', 'metrics', 'favicon.ico', 'robots.txt'])
-
-function isRedirectRequest(request: { method: string; url: string }): boolean {
-  if (request.method !== 'GET') return false
-  if (!request.url?.startsWith('/')) return false
-  if (request.url.startsWith('/v1/')) return false
-
-  const segment = request.url.slice(1).split(/[/?#]/)[0] ?? ''
-  return segment.length > 0 && !SYSTEM_PATHS.has(segment)
+export interface BuildAppOptions {
+  /** Test seam: collect log output in a stream instead of stdout. */
+  logSink?: NodeJS.WritableStream
+  /** Test seam: raise the request budgets so a test suite cannot throttle itself. */
+  rateLimits?: Partial<Record<'default' | 'register' | 'login', number>>
 }
 
-function buildLoggerOptions(): pino.LoggerOptions {
-  return {
+/** Fastify's logger options plus the pino options it forwards. */
+type LoggerConfig = FastifyLoggerOptions & LoggerOptions
+
+function buildLogger(sink: NodeJS.WritableStream | undefined): LoggerConfig {
+  const logger: LoggerConfig = {
     level: env.LOG_LEVEL,
+    // Fastify's own `req` serializer logs method and url only, so request
+    // headers never reach the log at all. These paths cover the case it misses:
+    // code that logs `request.headers` itself.
     redact: {
       paths: [
         'req.headers.authorization',
@@ -38,71 +36,55 @@ function buildLoggerOptions(): pino.LoggerOptions {
       censor: '[redacted]',
     },
   }
+
+  if (sink) {
+    logger.stream = sink
+  } else if (env.NODE_ENV === 'development' && env.LOG_LEVEL !== 'silent') {
+    logger.transport = {
+      target: 'pino-pretty',
+      options: { colorize: true, translateTime: 'HH:MM:ss.l' },
+    }
+  }
+
+  return logger
 }
 
-export interface BuildAppOptions {
-  logDestination?: NodeJS.WritableStream
-
-  rateLimitOverrides?: Partial<Record<'register' | 'auth', number>>
-}
-
+/**
+ * Builds the app without listening, so tests can drive it with `inject()`.
+ */
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
-  const loggerOptions = buildLoggerOptions()
-
-  const usePretty =
-    !options.logDestination && env.NODE_ENV === 'development' && loggerOptions.level !== 'silent'
-
-  const loggerInstance: FastifyBaseLogger | undefined = options.logDestination
-    ? pino(loggerOptions, options.logDestination)
-    : undefined
-
   const app = Fastify({
+    logger: buildLogger(options.logSink),
+
+    // Fastify sets ajv's `removeAdditional: true`, which deletes unknown body
+    // properties instead of rejecting them. On a credential endpoint that turns
+    // a typo like `passwrod` into "invalid credentials" forever.
     ajv: { customOptions: { removeAdditional: false } },
-
-    logController: new LogController({
-      disableRequestLogging: isRedirectRequest,
-      requestIdLogLabel: 'reqId',
-    }),
-
-    ...(loggerInstance
-      ? { loggerInstance }
-      : {
-          logger: {
-            ...loggerOptions,
-            transport: usePretty
-              ? { target: 'pino-pretty', options: { colorize: true, translateTime: 'HH:MM:ss.l' } }
-              : undefined,
-          },
-        }),
-
-    genReqId: (req) => {
-      const incoming = req.headers['x-request-id']
-      return typeof incoming === 'string' && REQUEST_ID.test(incoming) ? incoming : randomUUID()
-    },
   })
 
   registerErrors(app)
-
   await app.register(helmet, { contentSecurityPolicy: false })
-  await app.register(sensible)
 
   registerDb(app)
   await registerCache(app)
 
+  // Redis-backed, so the budget is shared by every instance behind a load
+  // balancer. skipOnError: a Redis outage should cost throughput, not
+  // availability — failing closed would let anyone take the service down by
+  // taking Redis down.
   await app.register(rateLimit, {
-    global: false,
-    max: env.RATE_LIMIT_REDIRECT_MAX,
+    max: options.rateLimits?.default ?? env.RATE_LIMIT_MAX,
     timeWindow: env.RATE_LIMIT_WINDOW,
-    keyGenerator: (req) => req.ip,
-
     redis: app.cache,
     nameSpace: 'shortener:rl:',
-
     skipOnError: true,
   })
 
   registerHealth(app)
-  registerAuthRoutes(app, { rateLimitOverrides: options.rateLimitOverrides })
+  registerAuthRoutes(app, {
+    registerMax: options.rateLimits?.register ?? env.RATE_LIMIT_REGISTER_MAX,
+    loginMax: options.rateLimits?.login ?? env.RATE_LIMIT_LOGIN_MAX,
+  })
 
   return app
 }

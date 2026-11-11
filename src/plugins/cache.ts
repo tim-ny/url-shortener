@@ -2,12 +2,9 @@ import { Redis } from 'ioredis'
 import type { FastifyInstance } from 'fastify'
 import { env } from '../config/env.js'
 
-export type Cache = Redis
-
 declare module 'fastify' {
   interface FastifyInstance {
-    cache: Cache
-    pingCache: () => Promise<void>
+    cache: Redis
   }
 }
 
@@ -15,12 +12,14 @@ export async function registerCache(app: FastifyInstance): Promise<void> {
   const cache = new Redis(env.REDIS_URL, {
     lazyConnect: true,
 
+    // Never let a command sit in a retry queue waiting for an unreachable
+    // Redis: with these defaults a request would hang instead of falling back
+    // to Postgres.
     enableOfflineQueue: false,
     maxRetriesPerRequest: 1,
 
     connectTimeout: 5_000,
     commandTimeout: 2_000,
-
     retryStrategy: (attempt) => Math.min(attempt * 200, 5_000),
   })
 
@@ -29,10 +28,9 @@ export async function registerCache(app: FastifyInstance): Promise<void> {
   })
 
   app.decorate('cache', cache)
-  app.decorate('pingCache', async () => {
-    await cache.ping()
-  })
 
+  // Connect before serving traffic. Failing here is survivable: ioredis keeps
+  // retrying in the background and the app runs slower, from Postgres alone.
   try {
     await cache.connect()
   } catch (err) {

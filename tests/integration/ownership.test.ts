@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify'
 import { buildApp } from '../../src/app.js'
 import { authenticate, requireOwner } from '../../src/modules/auth/guards.js'
 import { links } from '../../src/db/schema.js'
+import { NO_RATE_LIMITS, truncateAll } from '../helpers.js'
 
 let app: FastifyInstance
 
@@ -13,7 +14,7 @@ const THEIRS = 'theirs1'
 const MISSING = 'nope001'
 
 beforeAll(async () => {
-  app = await buildApp({ rateLimitOverrides: { register: 10_000, auth: 10_000 } })
+  app = await buildApp({ rateLimits: NO_RATE_LIMITS })
 
   app.get('/probe/owned/:code', { preHandler: [authenticate, requireOwner] }, (request) => ({
     ok: true,
@@ -31,28 +32,25 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await app.db.execute(sql`TRUNCATE TABLE users, api_keys, links, clicks RESTART IDENTITY CASCADE`)
+  await truncateAll(app)
   await app.db.insert(links).values([
     { code: OWNED, targetUrl: 'https://owned.example.com', ownerId: null },
     { code: THEIRS, targetUrl: 'https://theirs.example.com', ownerId: null },
   ])
 })
 
-async function userWithLink(code: string): Promise<string> {
+/** Registers a user and makes them the owner of `code`. Returns their API key. */
+async function ownerOf(code: string): Promise<string> {
   const response = await app.inject({
     method: 'POST',
     url: '/v1/auth/register',
     payload: { email: `${code}@example.com`, password: PASSWORD },
   })
-  const key: string = response.json().apiKey.key
-  const ownerId: string = response.json().user.id
+  const { apiKey, user } = response.json()
 
-  await app.db
-    .update(links)
-    .set({ ownerId })
-    .where(sql`${links.code} = ${code}`)
+  await app.db.update(links).set({ ownerId: user.id }).where(sql`${links.code} = ${code}`)
 
-  return key
+  return apiKey.key as string
 }
 
 function auth(key: string) {
@@ -61,7 +59,7 @@ function auth(key: string) {
 
 describe('requireOwner', () => {
   it('passes for the owner', async () => {
-    const key = await userWithLink(OWNED)
+    const key = await ownerOf(OWNED)
 
     const response = await app.inject({
       method: 'GET',
@@ -74,7 +72,7 @@ describe('requireOwner', () => {
   })
 
   it('returns 404 for another user’s link, not 403', async () => {
-    const key = await userWithLink(THEIRS)
+    const key = await ownerOf(THEIRS)
 
     const response = await app.inject({
       method: 'GET',
@@ -86,7 +84,7 @@ describe('requireOwner', () => {
   })
 
   it('gives a byte-identical response for unowned and nonexistent', async () => {
-    const key = await userWithLink(THEIRS)
+    const key = await ownerOf(THEIRS)
 
     const unowned = await app.inject({
       method: 'GET',
@@ -99,13 +97,13 @@ describe('requireOwner', () => {
       headers: auth(key),
     })
 
-    expect(unowned.statusCode).toBe(missing.statusCode)
-    expect(unowned.headers['content-type']).toBe(missing.headers['content-type'])
-    expect(unowned.body).toBe(missing.body)
+    expect(missing.statusCode).toBe(unowned.statusCode)
+    expect(missing.headers['content-type']).toBe(unowned.headers['content-type'])
+    expect(missing.body).toBe(unowned.body)
   })
 
   it('treats an anonymous link as unowned by everyone', async () => {
-    const key = await userWithLink(THEIRS)
+    const key = await ownerOf(THEIRS)
 
     const response = await app.inject({
       method: 'GET',
@@ -118,11 +116,12 @@ describe('requireOwner', () => {
 
   it('requires authentication first', async () => {
     const response = await app.inject({ method: 'GET', url: `/probe/owned/${OWNED}` })
+
     expect(response.statusCode).toBe(401)
   })
 
   it('rejects a revoked key even for a link it owned', async () => {
-    const key = await userWithLink(OWNED)
+    const key = await ownerOf(OWNED)
 
     await app.db.execute(
       sql`UPDATE api_keys SET revoked_at = now()
@@ -138,15 +137,12 @@ describe('requireOwner', () => {
     expect(response.statusCode).toBe(401)
   })
 
-  it('does not treat a null owner as a match', async () => {
-    const key = await userWithLink(THEIRS)
+  it('refuses to run without an authenticated principal', async () => {
+    // The anonymous-owner case is covered above, through an authenticated
+    // request. This route skips `authenticate`, so the guard has nothing to
+    // compare an owner against.
+    const response = await app.inject({ method: 'GET', url: `/probe/optional/${OWNED}` })
 
-    const response = await app.inject({
-      method: 'GET',
-      url: `/probe/optional/${OWNED}`,
-      headers: auth(key),
-    })
-
-    expect([401, 404]).toContain(response.statusCode)
+    expect(response.statusCode).toBe(401)
   })
 })
